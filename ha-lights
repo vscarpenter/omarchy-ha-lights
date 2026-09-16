@@ -1,0 +1,251 @@
+#!/bin/bash
+# Home Assistant light control for the vscarpenter.ha-lights Omarchy bar widget.
+#
+#   ha-lights [options] status                   JSON: rooms, their lights, and a count of bulbs on
+#   ha-lights [options] on|off|toggle <target>   target: area:<area_id> or light.<entity>
+#   ha-lights [options] brightness <target> <1-100>
+#   ha-lights [options] all-on | all-off
+#
+# Options:
+#   --url <url>          Home Assistant base URL   (default: $HA_URL or http://homeassistant.local:8123)
+#   --token-file <path>  File holding a long-lived access token
+#                        (default: $HA_TOKEN_FILE or ~/.config/homeassistant/token)
+#   --demo               Use made-up rooms stored in $XDG_RUNTIME_DIR; no Home Assistant needed
+#
+# The token is handed to curl through a config file descriptor, so it never
+# appears in argv, the environment, or output.
+
+set -euo pipefail
+
+HA_URL="${HA_URL:-http://homeassistant.local:8123}"
+HA_TOKEN_FILE="${HA_TOKEN_FILE:-$HOME/.config/homeassistant/token}"
+DEMO=0
+
+fail() {
+  jq -cn --arg error "$1" '{error: $error}'
+  exit 1
+}
+
+while (($# > 0)); do
+  case "$1" in
+    --url)
+      [[ $# -ge 2 ]] || fail "--url needs a value"
+      HA_URL=$2
+      shift 2
+      ;;
+    --token-file)
+      [[ $# -ge 2 ]] || fail "--token-file needs a value"
+      HA_TOKEN_FILE=$2
+      shift 2
+      ;;
+    --demo)
+      DEMO=1
+      shift
+      ;;
+    *) break ;;
+  esac
+done
+
+HA_URL=${HA_URL%/}
+[[ $HA_TOKEN_FILE == "~/"* ]] && HA_TOKEN_FILE="$HOME/${HA_TOKEN_FILE#\~/}"
+
+# Validates in the calling shell (not a subshell) so fail() really exits.
+check_target() {
+  [[ $1 =~ ^area:[a-z0-9_]+$ || $1 =~ ^light\.[a-z0-9_]+$ ]] || fail "Invalid target: $1"
+}
+
+check_brightness() {
+  [[ $1 =~ ^[0-9]+$ && $1 -ge 1 && $1 -le 100 ]] ||
+    fail "Usage: ha-lights brightness <target> <1-100>"
+}
+
+# ---- Home Assistant ----------------------------------------------------------
+
+api() {
+  curl -fsS --max-time 8 \
+    -K <(printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '\n' <"$HA_TOKEN_FILE")") \
+    -H 'Content-Type: application/json' "$@"
+}
+
+# Rooms come from Home Assistant areas. A light group (Hue room groups
+# included) marks the room-level entity; everything else is an individual bulb.
+read -r -d '' STATUS_TEMPLATE <<'EOF' || true
+{%- set ns = namespace(rooms=[]) -%}
+{%- for a in areas() -%}
+  {%- set ls = namespace(items=[]) -%}
+  {%- for e in area_entities(a) | select('match', 'light\.') -%}
+    {%- set s = states[e] -%}
+    {%- if s is not none -%}
+      {%- set ls.items = ls.items + [{
+        'id': e,
+        'name': s.name,
+        'state': s.state,
+        'brightness': state_attr(e, 'brightness'),
+        'group': (state_attr(e, 'is_hue_group') or state_attr(e, 'entity_id') is not none) | bool
+      }] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if ls.items -%}
+    {%- set ns.rooms = ns.rooms + [{'id': a, 'name': area_name(a), 'lights': ls.items}] -%}
+  {%- endif -%}
+{%- endfor -%}
+{{ ns.rooms | tojson }}
+EOF
+
+# A room is on when its group light or any bulb is on: Hue updates group state
+# a beat after the bulbs, so either can lead. Brightness prefers the group
+# light, otherwise the brightest bulb, reported as 0-100.
+read -r -d '' SUMMARIZE <<'EOF' || true
+def pct: if . == null then 0 else (. / 255 * 100 | round) end;
+map(
+  (.lights | map(select(.group))) as $groups
+  | (.lights | map(select(.group | not))) as $bulbs
+  | ($bulbs | map(select(.state == "on"))) as $lit
+  | {
+      id, name,
+      on: (($groups | any(.state == "on")) or ($lit | length) > 0),
+      available: ((.lights | map(select(.state != "unavailable")) | length) > 0),
+      brightness: (if ($groups | length) > 0 then ($groups[0].brightness | pct)
+                   else ($lit | map(.brightness | pct) | max // 0) end),
+      lights: ($bulbs | map({id, name, on: (.state == "on"),
+                             available: (.state != "unavailable"),
+                             brightness: (.brightness | pct)}))
+    }
+)
+| sort_by(.name | ascii_downcase)
+| {rooms: ., on: (map(.lights[] | select(.on)) | length)}
+EOF
+
+ha_status() {
+  [[ -r $HA_TOKEN_FILE ]] || fail "Token file not readable: $HA_TOKEN_FILE"
+  local raw
+  raw=$(jq -n --arg t "$STATUS_TEMPLATE" '{template: $t}' |
+    api -X POST -d @- "$HA_URL/api/template") || fail "Can't reach Home Assistant at $HA_URL"
+  jq -c "$SUMMARIZE" <<<"$raw" || fail "Unexpected response from Home Assistant"
+}
+
+target_json() {
+  case "$1" in
+    area:*) jq -cn --arg a "${1#area:}" '{area_id: $a}' ;;
+    light.*) jq -cn --arg e "$1" '{entity_id: $e}' ;;
+  esac
+}
+
+ha_call() {
+  local service=$1 body=$2
+  [[ -r $HA_TOKEN_FILE ]] || fail "Token file not readable: $HA_TOKEN_FILE"
+  api -X POST -d "$body" "$HA_URL/api/services/light/$service" >/dev/null ||
+    fail "light.$service failed"
+  echo '{"ok":true}'
+}
+
+# ---- Demo --------------------------------------------------------------------
+
+DEMO_FILE="${XDG_RUNTIME_DIR:-/tmp}/ha-lights-demo.json"
+
+demo_seed() {
+  [[ -f $DEMO_FILE ]] && return
+  cat >"$DEMO_FILE" <<'EOF'
+[
+  {"id": "kitchen", "name": "Kitchen", "lights": [
+    {"id": "light.kitchen", "name": "Kitchen", "state": "on", "brightness": 230, "group": true},
+    {"id": "light.kitchen_pendant_1", "name": "Pendant 1", "state": "on", "brightness": 230, "group": false},
+    {"id": "light.kitchen_pendant_2", "name": "Pendant 2", "state": "on", "brightness": 230, "group": false},
+    {"id": "light.kitchen_counter", "name": "Counter strip", "state": "on", "brightness": 180, "group": false}]},
+  {"id": "living_room", "name": "Living Room", "lights": [
+    {"id": "light.living_room", "name": "Living Room", "state": "on", "brightness": 140, "group": true},
+    {"id": "light.floor_lamp", "name": "Floor lamp", "state": "on", "brightness": 140, "group": false},
+    {"id": "light.reading_lamp", "name": "Reading lamp", "state": "off", "brightness": null, "group": false}]},
+  {"id": "office", "name": "Office", "lights": [
+    {"id": "light.office", "name": "Office", "state": "off", "brightness": null, "group": true},
+    {"id": "light.desk_lamp", "name": "Desk lamp", "state": "off", "brightness": null, "group": false},
+    {"id": "light.office_ceiling", "name": "Ceiling", "state": "off", "brightness": null, "group": false}]},
+  {"id": "bedroom", "name": "Bedroom", "lights": [
+    {"id": "light.bedroom", "name": "Bedroom", "state": "off", "brightness": null, "group": true},
+    {"id": "light.bedside_left", "name": "Bedside left", "state": "off", "brightness": null, "group": false},
+    {"id": "light.bedside_right", "name": "Bedside right", "state": "off", "brightness": null, "group": false}]},
+  {"id": "porch", "name": "Porch", "lights": [
+    {"id": "light.porch", "name": "Porch", "state": "unavailable", "brightness": null, "group": false}]}
+]
+EOF
+}
+
+# Applies a change to every matching demo light. $match is a jq filter over a
+# room and light; $state and $bri (0-255 or null) describe the new values.
+demo_apply() {
+  local match=$1 state=$2 bri=$3 tmp
+  tmp=$(mktemp "$DEMO_FILE.XXXXXX")
+  # Group lights then follow their bulbs, as a Hue bridge does.
+  jq --argjson bri "$bri" --arg state "$state" "
+    map(. as \$room | .lights |= map(
+      if (.state != \"unavailable\") and ($match) then
+        .state = \$state
+        | .brightness = (if \$state == \"on\" then (\$bri // .brightness // 255) else null end)
+      else . end))
+    | map(
+      (.lights | map(select((.group | not) and .state == \"on\"))) as \$lit
+      | .lights |= map(
+        if .group then
+          .state = (if (\$lit | length) > 0 then \"on\" else \"off\" end)
+          | .brightness = (\$lit | map(.brightness) | max)
+        else . end))
+  " "$DEMO_FILE" >"$tmp" && mv "$tmp" "$DEMO_FILE"
+  echo '{"ok":true}'
+}
+
+demo_match() {
+  case "$1" in
+    area:*) printf '$room.id == "%s"' "${1#area:}" ;;
+    light.*) printf '.id == "%s"' "$1" ;;
+  esac
+}
+
+# "on" when any light the target covers is on.
+demo_state_of() {
+  jq -r "[.[] as \$room | \$room.lights[] | select($(demo_match "$1")) | .state]
+         | if index(\"on\") then \"on\" else \"off\" end" "$DEMO_FILE"
+}
+
+# ---- Commands ----------------------------------------------------------------
+
+if ((DEMO)); then
+  demo_seed
+fi
+
+command=${1:-}
+case "$command" in
+  status)
+    if ((DEMO)); then jq -c "$SUMMARIZE" "$DEMO_FILE"; else ha_status; fi
+    ;;
+  on | off | toggle)
+    [[ $# -eq 2 ]] || fail "Usage: ha-lights $command <target>"
+    check_target "$2"
+    if ((DEMO)); then
+      state=$command
+      [[ $command == toggle ]] && state=$([[ $(demo_state_of "$2") == on ]] && echo off || echo on)
+      demo_apply "$(demo_match "$2")" "$state" null
+    else
+      service=$([[ $command == on ]] && echo turn_on || { [[ $command == off ]] && echo turn_off || echo toggle; })
+      ha_call "$service" "$(target_json "$2")"
+    fi
+    ;;
+  brightness)
+    [[ $# -eq 3 ]] || fail "Usage: ha-lights brightness <target> <1-100>"
+    check_target "$2"
+    check_brightness "$3"
+    if ((DEMO)); then
+      demo_apply "$(demo_match "$2")" on "$(($3 * 255 / 100))"
+    else
+      ha_call turn_on "$(target_json "$2" | jq -c --argjson p "$3" '. + {brightness_pct: $p}')"
+    fi
+    ;;
+  all-on | all-off)
+    state=${command#all-}
+    if ((DEMO)); then
+      demo_apply true "$state" null
+    else
+      ha_call "turn_$state" '{"entity_id":"all"}'
+    fi
+    ;;
+  *) fail "Usage: ha-lights [--url URL] [--token-file PATH] [--demo] status|on|off|toggle|brightness|all-on|all-off" ;;
+esac
