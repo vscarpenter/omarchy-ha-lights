@@ -325,6 +325,7 @@ Panel {
                 iconText: "\uDB80\uDF35"
                 tooltipText: "All on"
                 foreground: root.bar ? root.bar.foreground : Color.foreground
+                enabled: root.loaded && root.error === ""
                 onClicked: root.allOn()
               }
 
@@ -333,7 +334,7 @@ Panel {
                 tooltipText: "All off"
                 foreground: root.bar ? root.bar.foreground : Color.foreground
                 hoverColor: root.bar ? root.bar.urgent : Color.urgent
-                enabled: root.onCount > 0
+                enabled: root.loaded && root.error === "" && root.onCount > 0
                 onClicked: root.allOff()
               }
             }
