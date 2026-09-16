@@ -146,6 +146,12 @@ Panel {
   function allOff() { setAll(false) }
   function allOn() { setAll(true) }
 
+  function toggleExpanded(roomId) {
+    var next = Object.assign({}, expanded)
+    next[roomId] = !next[roomId]
+    expanded = next
+  }
+
   function setBrightness(target, pct) {
     pct = Math.max(1, Math.round(pct))
     var changes = {}
