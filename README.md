@@ -33,12 +33,14 @@ or single bulbs on and off, set brightness, or turn the whole house on or off.
 omarchy plugin add https://github.com/vscarpenter/omarchy-ha-lights.git
 ```
 
-Review the code when prompted, then enable it and place it in the bar:
+Omarchy asks you to confirm, clones the plugin, then offers to enable it and
+asks which bar section to put it in. To place it next to the volume icon:
 
 ```bash
-omarchy plugin enable vscarpenter.ha-lights
 omarchy bar move vscarpenter.ha-lights --section right --before omarchy.audio
 ```
+
+If you skipped enabling, run `omarchy plugin enable vscarpenter.ha-lights`.
 
 Want to try it before connecting anything? Turn on demo mode (made-up rooms,
 nothing leaves your machine):
