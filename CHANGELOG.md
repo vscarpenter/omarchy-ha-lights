@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0 — 2026-09-16
+
+### Added
+
+- Lights that aren't assigned to an area appear in an "Other" room at the
+  bottom of the list instead of being hidden.
+- Keybinding and script control over IPC: `omarchy-shell vscarpenter.ha-lights
+  toggle|allOn|allOff|roomOn|roomOff|roomToggle|scene|refresh`.
+- Scenes assigned to an area show as buttons when the room is expanded.
+- A color temperature slider for rooms and bulbs that support it.
+- `ha-lights` gains `temp` and `scene` commands, and accepts a comma-separated
+  list of light entities as a target.
+
 ## 0.1.1 — 2026-09-16
 
 ### Fixed

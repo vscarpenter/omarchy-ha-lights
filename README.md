@@ -9,9 +9,15 @@ or single bulbs on and off, set brightness, or turn the whole house on or off.
 ## Features
 
 - **Rooms from Home Assistant areas.** Each area with lights gets a row with an
-  on/off switch and a brightness slider. Expand a room to control its bulbs.
+  on/off switch and a brightness slider. Expand a room to control its bulbs
+  and activate its scenes. Lights that aren't in an area are grouped under
+  "Other".
+- **Color temperature.** Rooms and bulbs that support it get a warm-to-cool
+  slider under the brightness slider.
 - **All on / all off** from the panel header. Right-click the bar icon to turn
   everything off.
+- **Keybindings.** Toggle the panel, a room, or a scene from a Hyprland
+  binding (see [Keybindings](#keybindings)).
 - **Feels instant.** Clicks show right away and are held until Home Assistant
   confirms, so switches don't flicker back while Hue and other hubs catch up.
 - **Follows your theme** using Omarchy's own panel, switch, and slider
@@ -71,7 +77,8 @@ omarchy bar set vscarpenter.ha-lights demo On
    ```
 
 4. **Assign lights to areas** in Home Assistant (Settings → Areas, labels &
-   zones) if you haven't. Lights without an area don't appear in the widget.
+   zones) if you haven't. Lights without an area are lumped together in an
+   "Other" room.
 
 If demo mode was on, turn it off with
 `omarchy bar set vscarpenter.ha-lights demo Off`.
@@ -94,8 +101,9 @@ Change these in Omarchy's bar settings or with `omarchy bar set`.
 | Left-click the bulb icon | Open or close the panel |
 | Right-click the bulb icon | Turn **every** light off |
 | Middle-click the bulb icon | Refresh now |
-| Room switch or slider | Controls every light in that area |
-| Arrow next to a room | Show that room's bulbs |
+| Room switch or sliders | Controls every light in that area |
+| Arrow next to a room | Show that room's bulbs and scenes |
+| Scene button | Activates that scene |
 | `r` / `Esc` in the panel | Refresh / close |
 
 The bulb icon is filled when any light is on, and its tooltip shows how many.
@@ -104,8 +112,41 @@ The bulb icon is filled when any light is on, and its tooltip shows how many.
 
 Rooms are Home Assistant areas that contain lights. If an area has a light
 group, such as a Hue room, the group is used for the room's switch and
-brightness, and the other lights are listed as bulbs. Turning a room on or off,
-or setting its brightness, targets the whole area.
+sliders, and the other lights are listed as bulbs. Turning a room on or off,
+or setting its brightness or color temperature, targets the whole area.
+Scenes assigned to the area are listed with the bulbs.
+
+Lights that aren't in any area appear in an "Other" room at the bottom. Its
+switch and sliders send the command to each of those lights.
+
+The color temperature slider appears only for lights that report the
+`color_temp` color mode, and its range comes from what the light supports.
+
+## Keybindings
+
+The widget registers an IPC target, so Hyprland bindings and scripts can drive
+it through `omarchy-shell`:
+
+```bash
+omarchy-shell vscarpenter.ha-lights toggle              # open or close the panel
+omarchy-shell vscarpenter.ha-lights allOff              # everything off
+omarchy-shell vscarpenter.ha-lights allOn
+omarchy-shell vscarpenter.ha-lights roomToggle office   # area id
+omarchy-shell vscarpenter.ha-lights roomOn office
+omarchy-shell vscarpenter.ha-lights roomOff office
+omarchy-shell vscarpenter.ha-lights scene scene.living_room_relax
+omarchy-shell vscarpenter.ha-lights refresh
+```
+
+In `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + CTRL + L", "Lights", "omarchy-shell vscarpenter.ha-lights toggle")
+o.bind("SUPER + CTRL + SHIFT + L", "Lights off", "omarchy-shell vscarpenter.ha-lights allOff")
+```
+
+Area ids are the slug Home Assistant shows in an area's settings URL, such as
+`living_room`. `ha-lights status | jq '.rooms[].id'` lists them.
 
 ## Command line
 
@@ -117,11 +158,14 @@ cd ~/.config/omarchy/plugins/vscarpenter.ha-lights
 ./ha-lights --url http://192.168.1.50:8123 status | jq
 ./ha-lights toggle area:kitchen
 ./ha-lights brightness light.desk_lamp 40
+./ha-lights temp light.desk_lamp 2700          # kelvin
+./ha-lights scene scene.living_room_relax
+./ha-lights off light.hallway_plug,light.garage
 ./ha-lights all-off
 ```
 
-Targets are `area:<area_id>` or a light entity id. Run `./ha-lights` with no
-arguments for the full usage.
+Targets are `area:<area_id>`, a light entity id, or a comma-separated list of
+light entity ids. Run `./ha-lights` with no arguments for the full usage.
 
 ## Security
 
@@ -143,7 +187,9 @@ To revoke access, delete the token in your Home Assistant profile.
   Test the connection from a terminal with the command-line example above.
 - **`homeassistant.local` doesn't resolve.** Use the IP address instead, or
   check that Avahi/mDNS is working.
-- **A room or light is missing.** Assign it to an area in Home Assistant.
+- **A light shows under "Other".** Assign it to an area in Home Assistant.
+- **No color temperature slider.** The light doesn't report the `color_temp`
+  color mode, or the room is off.
 - **Connection works but status fails.** The token's user may lack permission
   for the Home Assistant template API. Try a token from an administrator
   account.

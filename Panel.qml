@@ -9,6 +9,8 @@ import qs.Ui
 Panel {
   id: root
   moduleName: "vscarpenter.ha-lights"
+  // Own IpcHandler below: it adds light commands on top of open/close.
+  ipcTarget: "vscarpenter.ha-lights"
   manageIpc: false
 
   property var anchorItem: null
@@ -54,7 +56,10 @@ Panel {
   // What the user last asked for, keyed by "area:<id>" or light entity id.
   // Hue reports new state a second or more after a command, so a click is
   // held on screen until Home Assistant agrees or the hold expires.
+  // Brightness matches within 2%, color temperature within 100K (Hue rounds
+  // through mireds).
   readonly property int holdMs: 8000
+  readonly property int tempToleranceK: 100
   property var desired: ({})
   property var lastBrightness: ({})
 
@@ -104,25 +109,60 @@ Panel {
     settleTimer.restart()
   }
 
-  // changes: key -> true/false for on/off, or { on, brightness }.
+  // changes: key -> true/false for on/off, or { on, brightness } /
+  // { on, temp }. Slider holds merge so a brightness drag followed by a
+  // temperature drag keeps both; an on/off click replaces the hold.
   function hold(changes) {
     var next = Object.assign({}, desired)
     var until = Date.now() + holdMs
     for (var key in changes) {
       var c = changes[key]
-      next[key] = typeof c === "object" ? Object.assign({ until: until }, c) : { on: c, until: until }
+      next[key] = typeof c === "object"
+        ? Object.assign({}, next[key] || {}, c, { until: until })
+        : { on: c, until: until }
     }
     desired = next
     rooms = overlay(reported)
   }
 
+  // Hold key for a room, and the script target: the area, or every bulb for
+  // the "Other" room of lights that aren't in an area.
+  function roomKey(room) { return "area:" + room.id }
+  function roomTarget(room) {
+    if (!room.virtual) return "area:" + room.id
+    var ids = []
+    for (var i = 0; i < room.lights.length; i++)
+      if (room.lights[i].available) ids.push(room.lights[i].id)
+    return ids.join(",")
+  }
+
+  function findRoom(id) {
+    for (var i = 0; i < rooms.length; i++)
+      if (rooms[i].id === id) return rooms[i]
+    return null
+  }
+
   function setRoomOn(room, on) {
+    var target = roomTarget(room)
+    if (target === "") return
     var changes = {}
-    changes["area:" + room.id] = on
+    changes[roomKey(room)] = on
     for (var i = 0; i < room.lights.length; i++)
       if (room.lights[i].available) changes[room.lights[i].id] = on
     hold(changes)
-    run([on ? "on" : "off", "area:" + room.id])
+    run([on ? "on" : "off", target])
+  }
+
+  // From IPC: on is true, false, or null to toggle. Falls back to a plain
+  // area command when the room isn't loaded yet.
+  function setRoomState(areaId, on) {
+    var room = findRoom(areaId)
+    if (room) return setRoomOn(room, on === null ? !room.on : on)
+    run([on === null ? "toggle" : (on ? "on" : "off"), "area:" + areaId])
+  }
+
+  function runScene(entityId) {
+    run(["scene", entityId])
   }
 
   function setLightOn(light, on) {
@@ -152,13 +192,23 @@ Panel {
     expanded = next
   }
 
-  function setBrightness(target, pct) {
+  // key is the hold key (roomKey or light id); target is what the script gets.
+  function setBrightness(key, target, pct) {
     pct = Math.max(1, Math.round(pct))
     var changes = {}
-    changes[target] = { on: true, brightness: pct }
+    changes[key] = { on: true, brightness: pct }
     hold(changes)
     pendingBrightness = { target: target, pct: pct }
     brightnessDebounce.restart()
+  }
+
+  function setTemp(key, target, kelvin) {
+    kelvin = Math.round(kelvin)
+    var changes = {}
+    changes[key] = { on: true, temp: kelvin }
+    hold(changes)
+    pendingTemp = { target: target, kelvin: kelvin }
+    tempDebounce.restart()
   }
 
   // Lay held clicks over reported state. A hold ends once Home Assistant
@@ -176,12 +226,14 @@ Panel {
       var d = holds[key]
       var matches = d && item.on === d.on
         && (d.brightness === undefined || Math.abs(item.brightness - d.brightness) <= 2)
+        && (d.temp === undefined || Math.abs(item.temp - d.temp) <= tempToleranceK)
       if (d && (now > d.until || matches)) {
         delete holds[key]
         holdsChanged = true
       } else if (d) {
         item.on = d.on
         if (d.brightness !== undefined) item.brightness = d.brightness
+        if (d.temp !== undefined) item.temp = d.temp
       }
       if (item.on && !(item.brightness > 0)) item.brightness = remembered[key] || 0
     }
@@ -206,6 +258,8 @@ Panel {
   }
 
   property var pendingBrightness: null
+  property var pendingTemp: null
+  readonly property bool sliderPending: brightnessDebounce.running || tempDebounce.running
 
   Timer {
     id: brightnessDebounce
@@ -215,6 +269,34 @@ Panel {
       root.run(["brightness", root.pendingBrightness.target, String(root.pendingBrightness.pct)])
       root.pendingBrightness = null
     }
+  }
+
+  Timer {
+    id: tempDebounce
+    interval: 250
+    onTriggered: {
+      if (!root.pendingTemp) return
+      root.run(["temp", root.pendingTemp.target, String(root.pendingTemp.kelvin)])
+      root.pendingTemp = null
+    }
+  }
+
+  // Hotkeys and scripts: omarchy-shell vscarpenter.ha-lights <method> [arg]
+  IpcHandler {
+    target: root.ipcTarget
+
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function refresh(): void { root.refresh() }
+    function allOn(): void { root.allOn() }
+    function allOff(): void { root.allOff() }
+    function roomOn(areaId: string): void { root.setRoomState(areaId, true) }
+    function roomOff(areaId: string): void { root.setRoomState(areaId, false) }
+    function roomToggle(areaId: string): void { root.setRoomState(areaId, null) }
+    function scene(entityId: string): void { root.runScene(entityId) }
   }
 
   Timer {
@@ -270,13 +352,60 @@ Panel {
           }
           root.reported = parsed.rooms || []
           // A slider mid-drag would jump if we replaced the model under it.
-          if (!brightnessDebounce.running) root.rooms = root.overlay(root.reported)
+          if (!root.sliderPending) root.rooms = root.overlay(root.reported)
           root.error = ""
           root.loaded = true
         } catch (e) {
           root.error = raw === "" ? "No response" : "Bad response"
         }
       }
+    }
+  }
+
+  // Color temperature row: thermometer icon, warm-to-cool slider, kelvin label.
+  component TempSlider: Item {
+    id: temp
+    property color fg: Color.foreground
+    property var item: ({})
+    signal changed(real kelvin)
+    height: slider.implicitHeight
+
+    Text {
+      id: tempIcon
+      textFormat: Text.PlainText
+      anchors.left: parent.left
+      anchors.verticalCenter: parent.verticalCenter
+      text: "󰔏"
+      color: Qt.darker(temp.fg, 1.4)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
+    }
+
+    PanelSlider {
+      id: slider
+      bar: root.bar
+      anchors.left: tempIcon.right
+      anchors.leftMargin: Style.space(6)
+      anchors.right: tempLabel.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      minimum: temp.item.tempMin || 2000
+      maximum: Math.max(minimum + 100, temp.item.tempMax || 6500)
+      step: 100
+      integer: true
+      value: temp.item.temp > 0 ? temp.item.temp : minimum
+      onReleased: function(v) { temp.changed(v) }
+    }
+
+    Text {
+      id: tempLabel
+      textFormat: Text.PlainText
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      text: Math.round(slider.liveValue) + "K"
+      color: Qt.darker(temp.fg, 1.4)
+      font.family: Style.font.family
+      font.pixelSize: Style.font.caption
     }
   }
 
@@ -388,9 +517,9 @@ Panel {
                   id: chevron
                   anchors.left: parent.left
                   anchors.verticalCenter: parent.verticalCenter
-                  visible: roomItem.room.lights.length > 1
+                  visible: roomItem.room.lights.length > 1 || roomItem.room.scenes.length > 0
                   iconText: roomItem.isExpanded ? "󰅀" : "󰅂"
-                  tooltipText: roomItem.isExpanded ? "Hide bulbs" : "Show bulbs"
+                  tooltipText: roomItem.isExpanded ? "Hide details" : "Show bulbs and scenes"
                   foreground: roomItem.fg
                   onClicked: root.toggleExpanded(roomItem.room.id)
                 }
@@ -443,7 +572,41 @@ Panel {
                 step: 5
                 integer: true
                 value: roomItem.room.brightness
-                onReleased: function(v) { root.setBrightness("area:" + roomItem.room.id, v) }
+                onReleased: function(v) { root.setBrightness(root.roomKey(roomItem.room), root.roomTarget(roomItem.room), v) }
+              }
+
+              TempSlider {
+                visible: roomItem.room.on && roomItem.room.hasTemp
+                x: chevron.width + Style.space(6)
+                width: parent.width - x - Style.space(8)
+                fg: roomItem.fg
+                item: roomItem.room
+                onChanged: function(v) { root.setTemp(root.roomKey(roomItem.room), root.roomTarget(roomItem.room), v) }
+              }
+
+              // Scenes assigned to the area, shown with the bulbs.
+              Flow {
+                visible: roomItem.isExpanded && roomItem.room.scenes.length > 0
+                x: Style.space(48)
+                width: roomItem.width - x
+                spacing: Style.space(6)
+
+                Repeater {
+                  model: roomItem.isExpanded ? roomItem.room.scenes : []
+
+                  delegate: Button {
+                    required property var modelData
+                    text: modelData.name
+                    tooltipText: "Activate scene"
+                    fontSize: Style.font.bodySmall
+                    foreground: roomItem.fg
+                    fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+                    horizontalPadding: Style.spacing.sm
+                    verticalPadding: Style.spacing.controlPaddingY
+                    bordered: true
+                    onClicked: root.runScene(modelData.id)
+                  }
+                }
               }
 
               Repeater {
@@ -497,7 +660,15 @@ Panel {
                     step: 5
                     integer: true
                     value: bulbItem.light.brightness
-                    onReleased: function(v) { root.setBrightness(bulbItem.light.id, v) }
+                    onReleased: function(v) { root.setBrightness(bulbItem.light.id, bulbItem.light.id, v) }
+                  }
+
+                  TempSlider {
+                    visible: bulbItem.light.on && bulbItem.light.hasTemp
+                    width: parent.width - Style.space(8)
+                    fg: roomItem.fg
+                    item: bulbItem.light
+                    onChanged: function(v) { root.setTemp(bulbItem.light.id, bulbItem.light.id, v) }
                   }
                 }
               }

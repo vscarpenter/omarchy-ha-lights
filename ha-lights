@@ -1,9 +1,11 @@
 #!/bin/bash
 # Home Assistant light control for the vscarpenter.ha-lights Omarchy bar widget.
 #
-#   ha-lights [options] status                   JSON: rooms, their lights, and a count of bulbs on
-#   ha-lights [options] on|off|toggle <target>   target: area:<area_id> or light.<entity>
+#   ha-lights [options] status                   JSON: rooms, their lights and scenes, and a count of bulbs on
+#   ha-lights [options] on|off|toggle <target>   target: area:<area_id>, light.<entity>, or light.a,light.b
 #   ha-lights [options] brightness <target> <1-100>
+#   ha-lights [options] temp <target> <kelvin>    color temperature, 1000-10000
+#   ha-lights [options] scene <scene.entity>
 #   ha-lights [options] all-on | all-off
 #
 # Options:
@@ -51,12 +53,21 @@ HA_URL=${HA_URL%/}
 
 # Validates in the calling shell (not a subshell) so fail() really exits.
 check_target() {
-  [[ $1 =~ ^area:[a-z0-9_]+$ || $1 =~ ^light\.[a-z0-9_]+$ ]] || fail "Invalid target: $1"
+  [[ $1 =~ ^area:[a-z0-9_]+$ || $1 =~ ^light\.[a-z0-9_]+(,light\.[a-z0-9_]+)*$ ]] || fail "Invalid target: $1"
+}
+
+check_scene() {
+  [[ $1 =~ ^scene\.[a-z0-9_]+$ ]] || fail "Invalid scene: $1"
 }
 
 check_brightness() {
   [[ $1 =~ ^[0-9]+$ && $1 -ge 1 && $1 -le 100 ]] ||
     fail "Usage: ha-lights brightness <target> <1-100>"
+}
+
+check_temp() {
+  [[ $1 =~ ^[0-9]+$ && $1 -ge 1000 && $1 -le 10000 ]] ||
+    fail "Usage: ha-lights temp <target> <1000-10000>"
 }
 
 # ---- Home Assistant ----------------------------------------------------------
@@ -67,54 +78,91 @@ api() {
     -H 'Content-Type: application/json' "$@"
 }
 
-# Rooms come from Home Assistant areas. A light group (Hue room groups
-# included) marks the room-level entity; everything else is an individual bulb.
+# Rooms come from Home Assistant areas, plus an "Other" room for lights that
+# aren't in any area. A light group (Hue room groups included) marks the
+# room-level entity; everything else is an individual bulb. Scenes assigned
+# to the area are listed with it.
 read -r -d '' STATUS_TEMPLATE <<'EOF' || true
-{%- set ns = namespace(rooms=[]) -%}
+{%- set ns = namespace(rooms=[], assigned=[]) -%}
 {%- for a in areas() -%}
-  {%- set ls = namespace(items=[]) -%}
-  {%- for e in area_entities(a) | select('match', 'light\.') -%}
+  {%- set ns.assigned = ns.assigned + (area_entities(a) | select('match', 'light\.') | list) -%}
+{%- endfor -%}
+{%- set orphans = states.light | map(attribute='entity_id') | reject('in', ns.assigned) | list -%}
+{%- for a in areas() + [none] -%}
+  {%- set ents = area_entities(a) if a is not none else orphans -%}
+  {%- set ls = namespace(items=[], scenes=[]) -%}
+  {%- for e in ents | select('match', 'light\.') -%}
     {%- set s = states[e] -%}
     {%- if s is not none -%}
+      {%- set modes = state_attr(e, 'supported_color_modes') or [] -%}
       {%- set ls.items = ls.items + [{
         'id': e,
         'name': s.name,
         'state': s.state,
         'brightness': state_attr(e, 'brightness'),
+        'temp': state_attr(e, 'color_temp_kelvin'),
+        'temp_min': state_attr(e, 'min_color_temp_kelvin'),
+        'temp_max': state_attr(e, 'max_color_temp_kelvin'),
+        'has_temp': ('color_temp' in modes),
         'group': (state_attr(e, 'is_hue_group') or state_attr(e, 'entity_id') is not none) | bool
       }] -%}
     {%- endif -%}
   {%- endfor -%}
+  {%- for e in ents | select('match', 'scene\.') -%}
+    {%- if states[e] is not none -%}
+      {%- set ls.scenes = ls.scenes + [{'id': e, 'name': states[e].name}] -%}
+    {%- endif -%}
+  {%- endfor -%}
   {%- if ls.items -%}
-    {%- set ns.rooms = ns.rooms + [{'id': a, 'name': area_name(a), 'lights': ls.items}] -%}
+    {%- set ns.rooms = ns.rooms + [{
+      'id': a if a is not none else '_unassigned',
+      'name': area_name(a) if a is not none else 'Other',
+      'virtual': a is none,
+      'lights': ls.items,
+      'scenes': ls.scenes
+    }] -%}
   {%- endif -%}
 {%- endfor -%}
 {{ ns.rooms | tojson }}
 EOF
 
 # A room is on when its group light or any bulb is on: Hue updates group state
-# a beat after the bulbs, so either can lead. Brightness prefers the group
-# light, otherwise the brightest bulb, reported as 0-100.
+# a beat after the bulbs, so either can lead. Brightness and color temperature
+# prefer the group light, otherwise the lit bulbs; brightness is reported as
+# 0-100 and temperature in kelvin. The "Other" room sorts last.
 read -r -d '' SUMMARIZE <<'EOF' || true
 def pct: if . == null then 0 else (. / 255 * 100 | round) end;
+def kelvin: if . == null then 0 else round end;
 # Sort key that orders "Light 2" before "Light 10".
 def natural: ascii_downcase | [scan("[0-9]+|[^0-9]+") | (tonumber? // .)];
 map(
   (.lights | map(select(.group))) as $groups
   | (.lights | map(select(.group | not))) as $bulbs
   | ($bulbs | map(select(.state == "on"))) as $lit
+  | (.lights | map(select(.has_temp))) as $tempable
   | {
       id, name,
+      virtual: (.virtual // false),
       on: (($groups | any(.state == "on")) or ($lit | length) > 0),
       available: ((.lights | map(select(.state != "unavailable")) | length) > 0),
       brightness: (if ($groups | length) > 0 then ($groups[0].brightness | pct)
                    else ($lit | map(.brightness | pct) | max // 0) end),
+      hasTemp: (($tempable | length) > 0),
+      temp: (if ($groups | length) > 0 and $groups[0].has_temp then ($groups[0].temp | kelvin)
+             else (($lit | map(.temp) | map(select(. != null)) | first) // 0) end),
+      tempMin: (($tempable | map(.temp_min) | map(select(. != null)) | min) // 2000),
+      tempMax: (($tempable | map(.temp_max) | map(select(. != null)) | max) // 6500),
+      scenes: ((.scenes // []) | sort_by(.name | natural) | map({id, name})),
       lights: ($bulbs | sort_by(.name | natural) | map({id, name, on: (.state == "on"),
                              available: (.state != "unavailable"),
-                             brightness: (.brightness | pct)}))
+                             brightness: (.brightness | pct),
+                             hasTemp: (.has_temp // false),
+                             temp: (.temp | kelvin),
+                             tempMin: (.temp_min // 2000),
+                             tempMax: (.temp_max // 6500)}))
     }
 )
-| sort_by(.name | natural)
+| sort_by([.virtual, (.name | natural)])
 | {rooms: ., on: (map(.lights[] | select(.on)) | length)}
 EOF
 
@@ -129,15 +177,16 @@ ha_status() {
 target_json() {
   case "$1" in
     area:*) jq -cn --arg a "${1#area:}" '{area_id: $a}' ;;
-    light.*) jq -cn --arg e "$1" '{entity_id: $e}' ;;
+    light.*) jq -cn --arg e "$1" '{entity_id: ($e | split(","))}' ;;
   esac
 }
 
+# ha_call <domain> <service> <json body>
 ha_call() {
-  local service=$1 body=$2
+  local domain=$1 service=$2 body=$3
   [[ -r $HA_TOKEN_FILE ]] || fail "Token file not readable: $HA_TOKEN_FILE"
-  api -X POST -d "$body" "$HA_URL/api/services/light/$service" >/dev/null ||
-    fail "light.$service failed"
+  api -X POST -d "$body" "$HA_URL/api/services/$domain/$service" >/dev/null ||
+    fail "$domain.$service failed"
   echo '{"ok":true}'
 }
 
@@ -145,44 +194,60 @@ ha_call() {
 
 DEMO_FILE="${XDG_RUNTIME_DIR:-/tmp}/ha-lights-demo.json"
 
+# Reseeds when the file predates the fields this version reads.
 demo_seed() {
-  [[ -f $DEMO_FILE ]] && return
+  [[ -f $DEMO_FILE ]] && jq -e '.[0].lights[0] | has("has_temp")' "$DEMO_FILE" >/dev/null 2>&1 && return
   cat >"$DEMO_FILE" <<'EOF'
 [
   {"id": "kitchen", "name": "Kitchen", "lights": [
-    {"id": "light.kitchen", "name": "Kitchen", "state": "on", "brightness": 230, "group": true},
-    {"id": "light.kitchen_pendant_1", "name": "Pendant 1", "state": "on", "brightness": 230, "group": false},
-    {"id": "light.kitchen_pendant_2", "name": "Pendant 2", "state": "on", "brightness": 230, "group": false},
-    {"id": "light.kitchen_counter", "name": "Counter strip", "state": "on", "brightness": 180, "group": false}]},
+    {"id": "light.kitchen", "name": "Kitchen", "state": "on", "brightness": 230, "temp": 4000, "temp_min": 2000, "temp_max": 6500, "has_temp": true, "group": true},
+    {"id": "light.kitchen_pendant_1", "name": "Pendant 1", "state": "on", "brightness": 230, "temp": 4000, "temp_min": 2000, "temp_max": 6500, "has_temp": true, "group": false},
+    {"id": "light.kitchen_pendant_2", "name": "Pendant 2", "state": "on", "brightness": 230, "temp": 4000, "temp_min": 2000, "temp_max": 6500, "has_temp": true, "group": false},
+    {"id": "light.kitchen_counter", "name": "Counter strip", "state": "on", "brightness": 180, "temp": null, "temp_min": null, "temp_max": null, "has_temp": false, "group": false}],
+   "scenes": [
+    {"id": "scene.kitchen_bright", "name": "Bright", "brightness": 255, "temp": 5000},
+    {"id": "scene.kitchen_dinner", "name": "Dinner", "brightness": 120, "temp": 2700}]},
   {"id": "living_room", "name": "Living Room", "lights": [
-    {"id": "light.living_room", "name": "Living Room", "state": "on", "brightness": 140, "group": true},
-    {"id": "light.floor_lamp", "name": "Floor lamp", "state": "on", "brightness": 140, "group": false},
-    {"id": "light.reading_lamp", "name": "Reading lamp", "state": "off", "brightness": null, "group": false}]},
+    {"id": "light.living_room", "name": "Living Room", "state": "on", "brightness": 140, "temp": 2700, "temp_min": 2000, "temp_max": 6500, "has_temp": true, "group": true},
+    {"id": "light.floor_lamp", "name": "Floor lamp", "state": "on", "brightness": 140, "temp": 2700, "temp_min": 2000, "temp_max": 6500, "has_temp": true, "group": false},
+    {"id": "light.reading_lamp", "name": "Reading lamp", "state": "off", "brightness": null, "temp": null, "temp_min": 2000, "temp_max": 6500, "has_temp": true, "group": false}],
+   "scenes": [
+    {"id": "scene.living_room_relax", "name": "Relax", "brightness": 90, "temp": 2200},
+    {"id": "scene.living_room_movie", "name": "Movie", "brightness": 30, "temp": 2000}]},
   {"id": "office", "name": "Office", "lights": [
-    {"id": "light.office", "name": "Office", "state": "off", "brightness": null, "group": true},
-    {"id": "light.desk_lamp", "name": "Desk lamp", "state": "off", "brightness": null, "group": false},
-    {"id": "light.office_ceiling", "name": "Ceiling", "state": "off", "brightness": null, "group": false}]},
+    {"id": "light.office", "name": "Office", "state": "off", "brightness": null, "temp": null, "temp_min": 2200, "temp_max": 6500, "has_temp": true, "group": true},
+    {"id": "light.desk_lamp", "name": "Desk lamp", "state": "off", "brightness": null, "temp": null, "temp_min": 2200, "temp_max": 6500, "has_temp": true, "group": false},
+    {"id": "light.office_ceiling", "name": "Ceiling", "state": "off", "brightness": null, "temp": null, "temp_min": 2200, "temp_max": 6500, "has_temp": true, "group": false}],
+   "scenes": []},
   {"id": "bedroom", "name": "Bedroom", "lights": [
-    {"id": "light.bedroom", "name": "Bedroom", "state": "off", "brightness": null, "group": true},
-    {"id": "light.bedside_left", "name": "Bedside left", "state": "off", "brightness": null, "group": false},
-    {"id": "light.bedside_right", "name": "Bedside right", "state": "off", "brightness": null, "group": false}]},
+    {"id": "light.bedroom", "name": "Bedroom", "state": "off", "brightness": null, "temp": null, "temp_min": null, "temp_max": null, "has_temp": false, "group": true},
+    {"id": "light.bedside_left", "name": "Bedside left", "state": "off", "brightness": null, "temp": null, "temp_min": null, "temp_max": null, "has_temp": false, "group": false},
+    {"id": "light.bedside_right", "name": "Bedside right", "state": "off", "brightness": null, "temp": null, "temp_min": null, "temp_max": null, "has_temp": false, "group": false}],
+   "scenes": []},
   {"id": "porch", "name": "Porch", "lights": [
-    {"id": "light.porch", "name": "Porch", "state": "unavailable", "brightness": null, "group": false}]}
+    {"id": "light.porch", "name": "Porch", "state": "unavailable", "brightness": null, "temp": null, "temp_min": null, "temp_max": null, "has_temp": false, "group": false}],
+   "scenes": []},
+  {"id": "_unassigned", "name": "Other", "virtual": true, "lights": [
+    {"id": "light.hallway_plug", "name": "Hallway lamp", "state": "off", "brightness": null, "temp": null, "temp_min": null, "temp_max": null, "has_temp": false, "group": false},
+    {"id": "light.garage", "name": "Garage", "state": "on", "brightness": 255, "temp": null, "temp_min": null, "temp_max": null, "has_temp": false, "group": false}],
+   "scenes": []}
 ]
 EOF
 }
 
 # Applies a change to every matching demo light. $match is a jq filter over a
-# room and light; $state and $bri (0-255 or null) describe the new values.
+# room and light; $state, $bri (0-255 or null) and $temp (kelvin or null)
+# describe the new values. A null keeps the light's current value.
 demo_apply() {
-  local match=$1 state=$2 bri=$3 tmp
+  local match=$1 state=$2 bri=$3 temp=${4:-null} tmp
   tmp=$(mktemp "$DEMO_FILE.XXXXXX")
   # Group lights then follow their bulbs, as a Hue bridge does.
-  jq --argjson bri "$bri" --arg state "$state" "
+  jq --argjson bri "$bri" --argjson temp "$temp" --arg state "$state" "
     map(. as \$room | .lights |= map(
       if (.state != \"unavailable\") and ($match) then
         .state = \$state
         | .brightness = (if \$state == \"on\" then (\$bri // .brightness // 255) else null end)
+        | .temp = (if \$state == \"on\" and .has_temp then (\$temp // .temp // 2700) else null end)
       else . end))
     | map(
       (.lights | map(select((.group | not) and .state == \"on\"))) as \$lit
@@ -190,6 +255,7 @@ demo_apply() {
         if .group then
           .state = (if (\$lit | length) > 0 then \"on\" else \"off\" end)
           | .brightness = (\$lit | map(.brightness) | max)
+          | .temp = (if .has_temp then (\$lit | map(.temp) | map(select(. != null)) | first) else null end)
         else . end))
   " "$DEMO_FILE" >"$tmp" && mv "$tmp" "$DEMO_FILE"
   echo '{"ok":true}'
@@ -198,8 +264,14 @@ demo_apply() {
 demo_match() {
   case "$1" in
     area:*) printf '$room.id == "%s"' "${1#area:}" ;;
-    light.*) printf '.id == "%s"' "$1" ;;
+    light.*) printf '(.id | IN(%s))' "$(jq -Rr 'split(",") | map(tojson) | join(",")' <<<"$1")" ;;
   esac
+}
+
+# Prints "<room id>\t<brightness>\t<temp>" for a demo scene, or nothing.
+demo_scene() {
+  jq -r --arg id "$1" '.[] | . as $room | (.scenes // [])[] | select(.id == $id)
+    | [$room.id, .brightness, (.temp // "null")] | @tsv' "$DEMO_FILE"
 }
 
 # "on" when any light the target covers is on.
@@ -228,7 +300,7 @@ case "$command" in
       demo_apply "$(demo_match "$2")" "$state" null
     else
       service=$([[ $command == on ]] && echo turn_on || { [[ $command == off ]] && echo turn_off || echo toggle; })
-      ha_call "$service" "$(target_json "$2")"
+      ha_call light "$service" "$(target_json "$2")"
     fi
     ;;
   brightness)
@@ -238,7 +310,28 @@ case "$command" in
     if ((DEMO)); then
       demo_apply "$(demo_match "$2")" on "$(($3 * 255 / 100))"
     else
-      ha_call turn_on "$(target_json "$2" | jq -c --argjson p "$3" '. + {brightness_pct: $p}')"
+      ha_call light turn_on "$(target_json "$2" | jq -c --argjson p "$3" '. + {brightness_pct: $p}')"
+    fi
+    ;;
+  temp)
+    [[ $# -eq 3 ]] || fail "Usage: ha-lights temp <target> <1000-10000>"
+    check_target "$2"
+    check_temp "$3"
+    if ((DEMO)); then
+      demo_apply "$(demo_match "$2")" on null "$3"
+    else
+      ha_call light turn_on "$(target_json "$2" | jq -c --argjson k "$3" '. + {color_temp_kelvin: $k}')"
+    fi
+    ;;
+  scene)
+    [[ $# -eq 2 ]] || fail "Usage: ha-lights scene <scene.entity>"
+    check_scene "$2"
+    if ((DEMO)); then
+      IFS=$'\t' read -r room bri temp < <(demo_scene "$2") || true
+      [[ -n ${room:-} ]] || fail "Unknown scene: $2"
+      demo_apply "\$room.id == \"$room\"" on "$bri" "$temp"
+    else
+      ha_call scene turn_on "$(jq -cn --arg e "$2" '{entity_id: $e}')"
     fi
     ;;
   all-on | all-off)
@@ -246,8 +339,8 @@ case "$command" in
     if ((DEMO)); then
       demo_apply true "$state" null
     else
-      ha_call "turn_$state" '{"entity_id":"all"}'
+      ha_call light "turn_$state" '{"entity_id":"all"}'
     fi
     ;;
-  *) fail "Usage: ha-lights [--url URL] [--token-file PATH] [--demo] status|on|off|toggle|brightness|all-on|all-off" ;;
+  *) fail "Usage: ha-lights [--url URL] [--token-file PATH] [--demo] status|on|off|toggle|brightness|temp|scene|all-on|all-off" ;;
 esac

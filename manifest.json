@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "vscarpenter.ha-lights",
   "name": "Home Assistant Lights",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "author": "Vinny Carpenter",
   "description": "Control Home Assistant lights by room from the Omarchy bar",
   "kinds": [
@@ -13,7 +13,7 @@
   },
   "barWidget": {
     "displayName": "Home Assistant Lights",
-    "description": "Turn rooms and bulbs on or off and set brightness",
+    "description": "Turn rooms and bulbs on or off, set brightness and color temperature, and activate scenes",
     "category": "Home",
     "allowMultiple": false,
     "defaultSection": "right",
