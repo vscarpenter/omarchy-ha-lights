@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "vscarpenter.ha-lights",
   "name": "Home Assistant Lights",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "Vinny Carpenter",
   "description": "Control Home Assistant lights by room from the Omarchy bar",
   "kinds": [
@@ -18,8 +18,9 @@
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
-      "url": "http://homeassistant.local:8123",
+      "url": "https://homeassistant.local:8123",
       "tokenFile": "~/.config/homeassistant/token",
+      "caFile": "",
       "refreshIntervalSec": 45,
       "demo": "Off"
     },
@@ -28,8 +29,8 @@
         "key": "url",
         "type": "string",
         "label": "Home Assistant URL",
-        "defaultValue": "http://homeassistant.local:8123",
-        "description": "Base URL of your Home Assistant instance, including the port."
+        "defaultValue": "https://homeassistant.local:8123",
+        "description": "Base URL of your Home Assistant instance, including the port. Must be https://, because the access token is sent with every request. Plain http:// is only accepted for 127.0.0.1 or [::1]."
       },
       {
         "key": "tokenFile",
@@ -37,6 +38,13 @@
         "label": "Token file",
         "defaultValue": "~/.config/homeassistant/token",
         "description": "File containing a Home Assistant long-lived access token. Keep it readable only by you (chmod 600)."
+      },
+      {
+        "key": "caFile",
+        "type": "path",
+        "label": "CA certificate file",
+        "defaultValue": "",
+        "description": "Optional PEM certificate to verify Home Assistant with, for a self-signed or private-CA certificate. Leave empty to use the system trust store."
       },
       {
         "key": "refreshIntervalSec",

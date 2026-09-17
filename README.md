@@ -70,11 +70,14 @@ omarchy bar set vscarpenter.ha-lights demo On
      && chmod 600 ~/.config/homeassistant/token && unset HA_TOKEN
    ```
 
-3. **Set your Home Assistant URL** if it isn't `http://homeassistant.local:8123`:
+3. **Set your Home Assistant URL** if it isn't `https://homeassistant.local:8123`:
 
    ```bash
-   omarchy bar set vscarpenter.ha-lights url http://192.168.1.50:8123
+   omarchy bar set vscarpenter.ha-lights url https://192.168.1.50:8123
    ```
+
+   The URL must be `https://`. See [HTTPS is required](#https-is-required) if
+   your Home Assistant only answers on plain `http://` today.
 
 4. **Assign lights to areas** in Home Assistant (Settings → Areas, labels &
    zones) if you haven't. Lights without an area are lumped together in an
@@ -89,8 +92,9 @@ Change these in Omarchy's bar settings or with `omarchy bar set`.
 
 | Key | Default | What it does |
 |---|---|---|
-| `url` | `http://homeassistant.local:8123` | Home Assistant base URL, including the port |
+| `url` | `https://homeassistant.local:8123` | Home Assistant base URL, including the port. Must be `https://`; plain `http://` is only accepted for `127.0.0.1` or `[::1]` |
 | `tokenFile` | `~/.config/homeassistant/token` | File holding the long-lived access token |
+| `caFile` | *(empty)* | PEM certificate to verify Home Assistant with, for a self-signed or private-CA certificate. Empty uses the system trust store |
 | `refreshIntervalSec` | `45` | How often to check light state while the panel is closed (every 5s while open) |
 | `demo` | `Off` | `On` shows made-up rooms without connecting to Home Assistant |
 
@@ -155,7 +159,7 @@ keybindings or troubleshooting:
 
 ```bash
 cd ~/.config/omarchy/plugins/vscarpenter.ha-lights
-./ha-lights --url http://192.168.1.50:8123 status | jq
+./ha-lights --url https://192.168.1.50:8123 status | jq
 ./ha-lights toggle area:kitchen
 ./ha-lights brightness light.desk_lamp 40
 ./ha-lights temp light.desk_lamp 2700          # kelvin
@@ -176,15 +180,44 @@ light entity ids. Run `./ha-lights` with no arguments for the full usage.
   your Home Assistant.
 - Like every Omarchy plugin, this runs as unsandboxed code inside
   `omarchy-shell`. Read the code before enabling it.
-- Home Assistant URLs are often plain `http://` on a home network. If you point
-  this at a remote instance, use `https://`.
+- The token is only sent over HTTPS. The script refuses any other URL before it
+  reads the token file, and never follows redirects. The one exception is plain
+  `http://` to a literal loopback address (`127.x.x.x` or `[::1]`), where the
+  request never leaves this machine; `localhost` and other hostnames don't
+  qualify, because a name can resolve anywhere.
+- Responses from Home Assistant are capped at 1 MiB. Anything larger is
+  rejected before it is parsed.
 
 To revoke access, delete the token in your Home Assistant profile.
+
+### HTTPS is required
+
+A long-lived access token sent over plain `http://` can be read and reused by
+anything else on the network, so the widget won't do it. If your Home Assistant
+is only reachable over `http://` today, pick one:
+
+- **Turn on TLS in Home Assistant.** Add `ssl_certificate` and `ssl_key` to the
+  [`http:` section](https://www.home-assistant.io/integrations/http/) of
+  `configuration.yaml`, or put a TLS reverse proxy in front of it (the NGINX
+  and Let's Encrypt add-ons do this).
+- **Using a self-signed or private-CA certificate?** Point `caFile` at the
+  certificate (PEM) so it can be verified. The certificate must name the host
+  or IP address that is in your `url`:
+
+  ```bash
+  omarchy bar set vscarpenter.ha-lights caFile ~/.config/homeassistant/ca.pem
+  ```
+
+Certificate verification is never skipped.
 
 ## Troubleshooting
 
 - **"Not connected" in the panel.** The message under the header says why.
   Test the connection from a terminal with the command-line example above.
+- **"Refusing to send the token over plain http".** The `url` setting starts
+  with `http://`. See [HTTPS is required](#https-is-required).
+- **"Can't verify Home Assistant's certificate".** The certificate is
+  self-signed or from a private CA. Set `caFile`.
 - **`homeassistant.local` doesn't resolve.** Use the IP address instead, or
   check that Avahi/mDNS is working.
 - **A light shows under "Other".** Assign it to an area in Home Assistant.

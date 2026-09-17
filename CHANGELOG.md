@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0 — 2026-09-17
+
+Security hardening from the plugin marketplace review.
+
+### Changed
+
+- **Breaking:** the Home Assistant URL must be `https://`, so the access token
+  is never sent in cleartext. Plain `http://` is accepted only for a literal
+  loopback address (`127.x.x.x` or `[::1]`). Other URLs are rejected before the
+  token file is read. The default URL is now `https://homeassistant.local:8123`.
+  If your `url` setting starts with `http://`, see "HTTPS is required" in the
+  README.
+- Responses from Home Assistant are capped at 1 MiB on every request and
+  rejected before parsing if larger.
+- curl is restricted to the scheme of the configured URL.
+
+### Added
+
+- `caFile` setting (`--ca-file`, `$HA_CA_FILE`) to verify a self-signed or
+  private-CA Home Assistant certificate.
+- Clearer errors for a refused `http://` URL and for a certificate that can't
+  be verified.
+
 ## 0.2.0 — 2026-09-16
 
 ### Added

@@ -9,18 +9,23 @@
 #   ha-lights [options] all-on | all-off
 #
 # Options:
-#   --url <url>          Home Assistant base URL   (default: $HA_URL or http://homeassistant.local:8123)
+#   --url <url>          Home Assistant base URL   (default: $HA_URL or https://homeassistant.local:8123)
+#                        Must be https://, or http:// to a literal loopback address (127.x.x.x, [::1])
 #   --token-file <path>  File holding a long-lived access token
 #                        (default: $HA_TOKEN_FILE or ~/.config/homeassistant/token)
+#   --ca-file <path>     CA certificate (PEM) to verify Home Assistant with, for a self-signed
+#                        or private-CA certificate (default: $HA_CA_FILE or the system trust store)
 #   --demo               Use made-up rooms stored in $XDG_RUNTIME_DIR; no Home Assistant needed
 #
 # The token is handed to curl through a config file descriptor, so it never
-# appears in argv, the environment, or output.
+# appears in argv, the environment, or output. It is only ever sent over TLS,
+# or to this machine itself.
 
 set -euo pipefail
 
-HA_URL="${HA_URL:-http://homeassistant.local:8123}"
+HA_URL="${HA_URL:-https://homeassistant.local:8123}"
 HA_TOKEN_FILE="${HA_TOKEN_FILE:-$HOME/.config/homeassistant/token}"
+HA_CA_FILE="${HA_CA_FILE:-}"
 DEMO=0
 
 fail() {
@@ -40,6 +45,11 @@ while (($# > 0)); do
       HA_TOKEN_FILE=$2
       shift 2
       ;;
+    --ca-file)
+      [[ $# -ge 2 ]] || fail "--ca-file needs a value"
+      HA_CA_FILE=$2
+      shift 2
+      ;;
     --demo)
       DEMO=1
       shift
@@ -50,6 +60,28 @@ done
 
 HA_URL=${HA_URL%/}
 [[ $HA_TOKEN_FILE == "~/"* ]] && HA_TOKEN_FILE="$HOME/${HA_TOKEN_FILE#\~/}"
+[[ $HA_CA_FILE == "~/"* ]] && HA_CA_FILE="$HOME/${HA_CA_FILE#\~/}"
+
+# The token is a long-lived credential, so it only travels over TLS. Plain
+# http is allowed to a literal loopback address and nothing else: a hostname,
+# "localhost" included, could resolve anywhere. The host pattern has no "@",
+# so userinfo tricks like http://127.0.0.1@elsewhere can't match either.
+# Sets HA_PROTO, the one scheme curl is then allowed to speak.
+check_url() {
+  local octet='(0|[1-9][0-9]{0,2})' rest='(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
+  local https="^https://([A-Za-z0-9._-]+|\\[[0-9A-Fa-f:.]+\\])$rest"
+  local loopback="^http://(127\\.$octet\\.$octet\\.$octet|\\[::1\\])$rest"
+  if [[ $HA_URL =~ $https ]]; then
+    HA_PROTO='=https'
+  elif [[ $HA_URL =~ $loopback ]] &&
+    { [[ -z ${BASH_REMATCH[2]} ]] || ((BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 && BASH_REMATCH[4] <= 255)); }; then
+    HA_PROTO='=http'
+  elif [[ $HA_URL == http://* ]]; then
+    fail "Refusing to send the token over plain http to ${HA_URL#http://}. Use an https:// URL (http is only allowed to 127.0.0.1 or [::1])"
+  else
+    fail "Invalid Home Assistant URL: $HA_URL"
+  fi
+}
 
 # Validates in the calling shell (not a subshell) so fail() really exits.
 check_target() {
@@ -72,10 +104,45 @@ check_temp() {
 
 # ---- Home Assistant ----------------------------------------------------------
 
+# Ceiling on any Home Assistant response. A house with hundreds of lights
+# stays well under it.
+MAX_RESPONSE_BYTES=$((1024 * 1024))
+E_TOO_LARGE=63 # curl's own exit code for --max-filesize
+
+# Runs before anything touches the token: the URL is vetted first.
+preflight() {
+  check_url
+  [[ -z $HA_CA_FILE || -r $HA_CA_FILE ]] || fail "CA file not readable: $HA_CA_FILE"
+  [[ -r $HA_TOKEN_FILE ]] || fail "Token file not readable: $HA_TOKEN_FILE"
+}
+
+# Every authenticated request goes through here. curl stops at the ceiling
+# itself; head caps what reaches the shell even if curl can't (older curl
+# ignores --max-filesize on chunked responses). Prints the body, or returns
+# E_TOO_LARGE, or curl's exit code.
 api() {
-  curl -fsS --max-time 8 \
-    -K <(printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '\n' <"$HA_TOKEN_FILE")") \
-    -H 'Content-Type: application/json' "$@"
+  local out rc=0
+  out=$(
+    curl -fsS --max-time 8 --max-filesize "$MAX_RESPONSE_BYTES" --proto "$HA_PROTO" \
+      ${HA_CA_FILE:+--cacert "$HA_CA_FILE"} \
+      -K <(printf 'header = "Authorization: Bearer %s"\n' "$(tr -d '\n' <"$HA_TOKEN_FILE")") \
+      -H 'Content-Type: application/json' "$@" |
+      head -c "$((MAX_RESPONSE_BYTES + 1))"
+    exit "${PIPESTATUS[0]}"
+  ) || rc=$?
+  local LC_ALL=C # count bytes, not characters
+  ((${#out} <= MAX_RESPONSE_BYTES)) || return "$E_TOO_LARGE"
+  ((rc == 0)) || return "$rc"
+  printf '%s' "$out"
+}
+
+# api_fail <api exit code> <fallback message>
+api_fail() {
+  case "$1" in
+    "$E_TOO_LARGE") fail "Response from Home Assistant is too large" ;;
+    60) fail "Can't verify Home Assistant's certificate. For a self-signed or private-CA certificate, set the CA file" ;;
+    *) fail "$2" ;;
+  esac
 }
 
 # Rooms come from Home Assistant areas, plus an "Other" room for lights that
@@ -167,10 +234,11 @@ map(
 EOF
 
 ha_status() {
-  [[ -r $HA_TOKEN_FILE ]] || fail "Token file not readable: $HA_TOKEN_FILE"
-  local raw
+  preflight
+  local raw rc=0
   raw=$(jq -n --arg t "$STATUS_TEMPLATE" '{template: $t}' |
-    api -X POST -d @- "$HA_URL/api/template") || fail "Can't reach Home Assistant at $HA_URL"
+    api -X POST -d @- "$HA_URL/api/template") || rc=$?
+  ((rc == 0)) || api_fail "$rc" "Can't reach Home Assistant at $HA_URL"
   jq -c "$SUMMARIZE" <<<"$raw" || fail "Unexpected response from Home Assistant"
 }
 
@@ -184,9 +252,10 @@ target_json() {
 # ha_call <domain> <service> <json body>
 ha_call() {
   local domain=$1 service=$2 body=$3
-  [[ -r $HA_TOKEN_FILE ]] || fail "Token file not readable: $HA_TOKEN_FILE"
-  api -X POST -d "$body" "$HA_URL/api/services/$domain/$service" >/dev/null ||
-    fail "$domain.$service failed"
+  preflight
+  local rc=0
+  api -X POST -d "$body" "$HA_URL/api/services/$domain/$service" >/dev/null || rc=$?
+  ((rc == 0)) || api_fail "$rc" "$domain.$service failed"
   echo '{"ok":true}'
 }
 

@@ -23,8 +23,10 @@ Panel {
   readonly property bool demo: setting("demo", "Off") === "On"
   readonly property var baseCommand: {
     var args = [script,
-      "--url", String(setting("url", "http://homeassistant.local:8123")),
+      "--url", String(setting("url", "https://homeassistant.local:8123")),
       "--token-file", String(setting("tokenFile", "~/.config/homeassistant/token"))]
+    var caFile = String(setting("caFile", ""))
+    if (caFile) args.push("--ca-file", caFile)
     if (demo) args.push("--demo")
     return args
   }
