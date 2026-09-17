@@ -4,7 +4,7 @@ A bar widget for [Omarchy](https://omarchy.org/) that controls your
 [Home Assistant](https://www.home-assistant.io/) lights by room: switch rooms
 or single bulbs on and off, set brightness, or turn the whole house on or off.
 
-![The lights panel open below the Omarchy bar](docs/screenshot.png)
+![The lights panel open below the Omarchy bar](preview.png)
 
 ## Features
 
