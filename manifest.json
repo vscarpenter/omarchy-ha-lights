@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "vscarpenter.ha-lights",
   "name": "Home Assistant Lights",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Vinny Carpenter",
   "description": "Control Home Assistant lights by room from the Omarchy bar",
   "kinds": [
