@@ -97,6 +97,8 @@ EOF
 # light, otherwise the brightest bulb, reported as 0-100.
 read -r -d '' SUMMARIZE <<'EOF' || true
 def pct: if . == null then 0 else (. / 255 * 100 | round) end;
+# Sort key that orders "Light 2" before "Light 10".
+def natural: ascii_downcase | [scan("[0-9]+|[^0-9]+") | (tonumber? // .)];
 map(
   (.lights | map(select(.group))) as $groups
   | (.lights | map(select(.group | not))) as $bulbs
@@ -107,12 +109,12 @@ map(
       available: ((.lights | map(select(.state != "unavailable")) | length) > 0),
       brightness: (if ($groups | length) > 0 then ($groups[0].brightness | pct)
                    else ($lit | map(.brightness | pct) | max // 0) end),
-      lights: ($bulbs | map({id, name, on: (.state == "on"),
+      lights: ($bulbs | sort_by(.name | natural) | map({id, name, on: (.state == "on"),
                              available: (.state != "unavailable"),
                              brightness: (.brightness | pct)}))
     }
 )
-| sort_by(.name | ascii_downcase)
+| sort_by(.name | natural)
 | {rooms: ., on: (map(.lights[] | select(.on)) | length)}
 EOF
 

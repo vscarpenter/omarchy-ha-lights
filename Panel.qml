@@ -454,7 +454,8 @@ Panel {
                   required property var modelData
                   readonly property var light: modelData
 
-                  x: Style.space(28)
+                  // Indented past the room name so bulbs read as children.
+                  x: Style.space(48)
                   width: roomItem.width - x
                   spacing: Style.space(2)
                   opacity: light.available ? 1 : 0.5
@@ -469,7 +470,7 @@ Panel {
                       anchors.right: bulbSwitch.left
                       anchors.verticalCenter: parent.verticalCenter
                       text: bulbItem.light.name + (bulbItem.light.available ? "" : " (unavailable)")
-                      color: roomItem.fg
+                      color: Qt.darker(roomItem.fg, 1.15)
                       font.family: Style.font.family
                       font.pixelSize: Style.font.bodySmall
                       elide: Text.ElideRight
